@@ -113,3 +113,47 @@ func Test_StreamingReaderBasic(t *testing.T) {
 	// Error expected with dummy data
 	t.Logf("Read returned: %v (expected with dummy data)", err)
 }
+
+// Test_RealFile tests decompression of a real file if provided
+func Test_RealFile(t *testing.T) {
+	// This test is for manual testing with real .Z files
+	// Set the environment variable TEST_Z_FILE to test with a real file
+	filename := os.Getenv("TEST_Z_FILE")
+	if filename == "" {
+		t.Skip("Skipping real file test - set TEST_Z_FILE environment variable to enable")
+	}
+	
+	t.Logf("Testing with file: %s", filename)
+	
+	// Check file exists
+	info, err := os.Stat(filename)
+	if err != nil {
+		t.Fatalf("File not found: %v", err)
+	}
+	t.Logf("File size: %d bytes (%.2f MB)", info.Size(), float64(info.Size())/(1024*1024))
+	
+	// Open file
+	f, err := os.Open(filename)
+	if err != nil {
+		t.Fatalf("Failed to open file: %v", err)
+	}
+	defer f.Close()
+	
+	// Enable verbose mode
+	VerboseFlag = true
+	defer func() { VerboseFlag = false }()
+	
+	// Decompress
+	reader, err := NewReader(f)
+	if err != nil {
+		t.Fatalf("NewReader failed: %v", err)
+	}
+	
+	// Read all data
+	data, err := ioutil.ReadAll(reader)
+	if err != nil {
+		t.Fatalf("ReadAll failed: %v", err)
+	}
+	
+	t.Logf("Successfully decompressed %d bytes", len(data))
+}

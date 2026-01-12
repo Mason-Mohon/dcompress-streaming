@@ -110,14 +110,31 @@ func NewReader(r io.Reader) (io.Reader, error) {
 	if f, ok := r.(*os.File); ok {
 		if stat, err := f.Stat(); err == nil {
 			compressedSize = stat.Size()
+			if VerboseFlag {
+				fmt.Printf("dcompress: File size detected: %d bytes (%.2f MB)\n",
+					compressedSize, float64(compressedSize)/(1024*1024))
+			}
 		}
 	}
 
 	// Use streaming for large or unknown-size files
-	// NOTE: Streaming implementation is currently experimental
-	// For production use, only enable for very large files or disable entirely
-	if compressedSize >= 500*1024*1024 {
+	// NOTE: Streaming implementation is currently experimental and has bugs
+	// DISABLED FOR NOW - always use buffered mode
+	useStreaming := false // Set to true to enable streaming for large files
+	if useStreaming && compressedSize >= 500*1024*1024 {
+		if VerboseFlag {
+			fmt.Printf("dcompress: Using STREAMING mode for large file\n")
+		}
 		return newStreamingReader(r)
+	}
+
+	if VerboseFlag {
+		if compressedSize >= 0 {
+			fmt.Printf("dcompress: Using BUFFERED mode for file of size %.2f MB\n",
+				float64(compressedSize)/(1024*1024))
+		} else {
+			fmt.Printf("dcompress: Using BUFFERED mode (size unknown)\n")
+		}
 	}
 
 	// NOTE BENE: sections that start with if DEBUG or if BUG will be removed by the compiler
