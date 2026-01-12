@@ -86,19 +86,38 @@ func dumpHTAB(s string) {
 }
 
 // NOTES:
-//  Z is a compression technique, not an archiver.
+//
+//	Z is a compression technique, not an archiver.
+//
 // NewReader will create a local copy of the uncompressed data.
-//Note that this will set upper limit on the size of an individual readable file.
+// Note that this will set upper limit on the size of an individual readable file.
+//
 //	Memory use expected to be < (CompressedFileSize * 10) for non-pathological cases.
 //	Unpacks 23 MB in less than one second on 4 Ghz AMD 64 (8120^OC).
+//
 // Go code is based on literal translation of compress42.c (ie it's not idiomatic
 // nor is it pretty) See doc.go for credits to the original writer(s)
+//
 //	Kludge is to fix a problem with first character being written to output buffer as zero always.
 //	We save first output character and then patch it into outbuf at end.  Not sure why this happens.
 //	Other than the kludge it's a very literal translation of compress42.c
 //
 // NewReader takes compressed data from input source r and returns a reader for the uncompressed version
+// For files >= 500MB compressed, uses streaming decompression to avoid loading entire file into memory
 func NewReader(r io.Reader) (io.Reader, error) {
+	// Try to determine compressed size
+	var compressedSize int64 = -1
+	if f, ok := r.(*os.File); ok {
+		if stat, err := f.Stat(); err == nil {
+			compressedSize = stat.Size()
+		}
+	}
+
+	// Use streaming for large or unknown-size files
+	if compressedSize < 0 || compressedSize >= 500*1024*1024 {
+		return newStreamingReader(r)
+	}
+
 	// NOTE BENE: sections that start with if DEBUG or if BUG will be removed by the compiler
 	// since they compile to if false.  Leaving them in for now won't hurt anything.  Once code is
 	// tested fully they can be stripped.
@@ -142,8 +161,8 @@ func NewReader(r io.Reader) (io.Reader, error) {
 		fmt.Printf("entered decompress()\n")
 	}
 
-	g_inbuf = make([]byte, iBufSize+64, iBufSize+64)
-	g_outbuf = make([]byte, oBufSize+2048, oBufSize+2048)
+	g_inbuf = make([]byte, iBufSize+64)
+	g_outbuf = make([]byte, oBufSize+2048)
 	outBuf = make([]byte, 0, 10000)
 	if BUG == 1 {
 		fmt.Printf("Sizeof(htab)= %d\n", len(g_htab)*1)
@@ -551,3 +570,421 @@ func NewReader(r io.Reader) (io.Reader, error) {
 	byteReader := bytes.NewReader(outBuf)
 	return byteReader, nil
 } // end of ReadAll aka decompress()
+
+// StreamingReader implements io.Reader for streaming decompression of large files
+type StreamingReader struct {
+	// Input source
+	r io.Reader
+
+	// Type definitions
+	code_int  func(int64) code_int_type
+	count_int func(int64) count_int_type
+
+	// State variables
+	INIT_BITS  uint8
+	FIRST      code_int_type
+	CLEAR      code_int_type
+	maxbits    uint8
+	block_mode int
+	stackNdx   int
+	code       code_int_type
+	finchar    int
+	oldcode    code_int_type
+	incode     code_int_type
+	inbits     int
+	posbits    int
+	outpos     int
+	insize     int
+	bitmask    int
+	free_ent   code_int_type
+	maxcode    code_int_type
+	maxmaxcode code_int_type
+	n_bits     uint
+	rsize      int
+	bytes_in   int
+	firstChar  byte
+	codesRead  int
+
+	// Buffers
+	inbuf       []byte
+	outbuf      []byte
+	outputReady []byte
+
+	// Hash and code tables (local copies)
+	htab    [hSize * 8]byte
+	codetab [hSize]uint16
+
+	// State machine tracking
+	initialized   bool
+	headerRead    bool
+	needsResetbuf bool
+	eof           bool
+	err           error
+
+	// Error types
+	ErrBadMagic     error
+	ErrCorruptInput error
+	ErrMaxBitsExcd  error
+	ErrOther        error
+}
+
+type code_int_type int64
+type count_int_type int64
+
+// newStreamingReader creates and initializes a StreamingReader for large file decompression
+func newStreamingReader(r io.Reader) (*StreamingReader, error) {
+	sr := &StreamingReader{
+		r:               r,
+		INIT_BITS:       uint8(9),
+		FIRST:           code_int_type(257),
+		CLEAR:           code_int_type(256),
+		maxbits:         nBits,
+		block_mode:      blockMode,
+		maxcode:         code_int_type((1 << nBits) - 1),
+		maxmaxcode:      code_int_type(1 << nBits),
+		oldcode:         -1,
+		ErrBadMagic:     errors.New("dcompress: Bad magic number "),
+		ErrCorruptInput: errors.New("dcompress: Corrupt input "),
+		ErrMaxBitsExcd:  errors.New("dcompress: maxbits exceeded "),
+		ErrOther:        errors.New("dcompress: Other error :-( "),
+	}
+
+	// Allocate buffers
+	sr.inbuf = make([]byte, iBufSize+64)
+	sr.outbuf = make([]byte, oBufSize+2048)
+	sr.outputReady = make([]byte, 0, oBufSize)
+
+	// Read and validate header
+	if err := sr.readHeader(); err != nil {
+		return nil, err
+	}
+
+	return sr, nil
+}
+
+// readHeader reads and validates the compressed file header
+func (sr *StreamingReader) readHeader() error {
+	if DEBUG == 1 {
+		fmt.Printf("entered decompress()\n")
+	}
+
+	// Read initial buffer
+	rsize, err := sr.r.Read(sr.inbuf[0:iBufSize])
+	if err != nil && err != io.EOF {
+		return err
+	}
+	sr.rsize = rsize
+	sr.insize = rsize
+
+	if DEBUG == 1 {
+		fmt.Printf("insize(%d) rsize(%d)\n", sr.insize, sr.rsize)
+	}
+
+	// Check magic bytes
+	if (sr.inbuf[0] != MagicBytes[0]) || (sr.inbuf[1] != MagicBytes[1]) {
+		return sr.ErrBadMagic
+	}
+
+	// Parse header
+	sr.maxbits = uint8(sr.inbuf[2] & bitMask)
+	sr.block_mode = int(sr.inbuf[2] & blockMode)
+	sr.maxmaxcode = (1 << sr.maxbits)
+
+	if DEBUG == 1 {
+		fmt.Printf("maxbits(%d) block_mode(%d) maxmaxcode(%d)\n",
+			sr.maxbits, sr.block_mode, sr.maxmaxcode)
+	}
+
+	if sr.maxbits > nBits {
+		return sr.ErrMaxBitsExcd
+	}
+
+	// Initialize decompression state
+	sr.bytes_in = sr.insize
+	sr.n_bits = uint(sr.INIT_BITS)
+	sr.maxcode = (1 << sr.n_bits) - 1
+	sr.bitmask = (1 << sr.n_bits) - 1
+	sr.oldcode = -1
+	sr.finchar = 0
+	sr.outpos = 0
+	sr.posbits = 3 << 3
+
+	if sr.block_mode != 0 {
+		sr.free_ent = sr.FIRST
+	} else {
+		sr.free_ent = 256
+	}
+
+	if DEBUG == 1 {
+		fmt.Printf("bytes_in(%d) maxcode(%d) bitmask(%d) posbits(%d) free_ent(%d)\n",
+			sr.bytes_in, int(sr.maxcode), sr.bitmask, sr.posbits, int(sr.free_ent))
+	}
+
+	// Initialize htab
+	for code := code_int_type(255); code >= 0; code-- {
+		sr.htab[code] = byte(code)
+	}
+
+	sr.headerRead = true
+	return nil
+}
+
+// Read implements io.Reader interface for streaming decompression
+func (sr *StreamingReader) Read(p []byte) (n int, err error) {
+	// Return any buffered output first
+	if len(sr.outputReady) > 0 {
+		n = copy(p, sr.outputReady)
+		sr.outputReady = sr.outputReady[n:]
+		if len(sr.outputReady) == 0 && sr.eof {
+			return n, io.EOF
+		}
+		return n, nil
+	}
+
+	// Check for EOF or previous errors
+	if sr.eof {
+		return 0, io.EOF
+	}
+	if sr.err != nil {
+		return 0, sr.err
+	}
+
+	// Decompress next chunk
+	sr.decompressChunk()
+
+	// Check if decompression produced an error
+	if sr.err != nil && sr.err != io.EOF {
+		return 0, sr.err
+	}
+
+	// Copy output to caller's buffer
+	if len(sr.outputReady) > 0 {
+		n = copy(p, sr.outputReady)
+		sr.outputReady = sr.outputReady[n:]
+
+		// If we hit EOF and returned all data, signal EOF
+		if len(sr.outputReady) == 0 && sr.eof {
+			return n, io.EOF
+		}
+		return n, nil
+	}
+
+	// No more data
+	if sr.eof {
+		return 0, io.EOF
+	}
+
+	// Should not reach here normally
+	return 0, nil
+}
+
+// decompressChunk processes the next chunk of compressed data
+func (sr *StreamingReader) decompressChunk() {
+	// Handle resetbuf at the start if flagged
+	if sr.needsResetbuf {
+		sr.resetBuffer()
+		sr.needsResetbuf = false
+	}
+
+	// Main decompression loop - process until we have output or hit EOF
+	for len(sr.outputReady) == 0 && !sr.eof && sr.err == nil {
+		// Reset buffer logic
+		sr.resetBuffer()
+
+		// Read more input if needed
+		if sr.insize < (len(sr.inbuf) - iBufSize) {
+			rsize, err := sr.r.Read(sr.inbuf[sr.insize : sr.insize+iBufSize])
+			if err != nil && err != io.EOF {
+				sr.err = err
+				return
+			}
+			sr.rsize = rsize
+			sr.insize += rsize
+		}
+
+		// Calculate inbits
+		if sr.rsize > 0 {
+			sr.inbits = (sr.insize - (sr.insize % int(sr.n_bits))) << 3
+		} else {
+			sr.inbits = (sr.insize << 3) - (int(sr.n_bits - 1))
+		}
+
+		// Process codes while we have input bits
+		processedAnyCode := false
+		for sr.inbits > sr.posbits && len(sr.outputReady) < oBufSize {
+			processedAnyCode = true
+
+			// Check if we need to increase bit size
+			if sr.free_ent > sr.maxcode {
+				sr.posbits = ((sr.posbits - 1) + ((int(sr.n_bits) << 3) - (sr.posbits-1+(int(sr.n_bits)<<3))%(int(sr.n_bits)<<3)))
+				sr.n_bits++
+				if sr.n_bits == uint(sr.maxbits) {
+					sr.maxcode = sr.maxmaxcode
+				} else {
+					sr.maxcode = (1 << sr.n_bits) - 1
+				}
+				sr.bitmask = (1 << sr.n_bits) - 1
+				sr.needsResetbuf = true
+				break
+			}
+
+			// Input next code
+			nBufNdx := sr.posbits >> 3
+			p1 := uint(sr.inbuf[nBufNdx])
+			p2 := uint(sr.inbuf[nBufNdx+1]) << 8
+			p3 := uint(sr.inbuf[nBufNdx+2]) << 16
+			t1 := p1 | p2 | p3
+			t2 := t1 >> uint(sr.posbits&0x7)
+			sr.posbits += int(sr.n_bits)
+			sr.code = code_int_type(int(t2) & sr.bitmask)
+			sr.codesRead++
+
+			// Handle first character kludge
+			if sr.firstChar == 0 && sr.codesRead == 1 {
+				sr.firstChar = byte(sr.code)
+			}
+
+			// First code special case
+			if sr.oldcode == -1 {
+				if sr.code >= 256 {
+					sr.err = sr.ErrOther
+					return
+				}
+				sr.oldcode = sr.code
+				sr.finchar = int(sr.oldcode)
+				sr.outbuf[sr.outpos] = byte(sr.finchar)
+				sr.outpos++
+				continue
+			}
+
+			// Handle CLEAR code
+			if (sr.code == sr.CLEAR) && (sr.block_mode != 0) {
+				// Clear code table
+				for i := 0; i < 256; i++ {
+					sr.codetab[i] = 0
+				}
+				sr.free_ent = sr.FIRST - 1
+				sr.posbits = ((sr.posbits - 1) + ((int(sr.n_bits) << 3) - (sr.posbits-1+(int(sr.n_bits)<<3))%(int(sr.n_bits)<<3)))
+				sr.n_bits = uint(sr.INIT_BITS)
+				sr.maxcode = (1 << sr.n_bits) - 1
+				sr.bitmask = (1 << sr.n_bits) - 1
+				sr.needsResetbuf = true
+				break
+			}
+
+			sr.incode = sr.code
+			sr.stackNdx = hSize*8 - 1
+
+			// Handle KwKwK case
+			if sr.code >= sr.free_ent {
+				if sr.code > sr.free_ent {
+					if VerboseFlag {
+						fmt.Printf("!Err-> dcompress: code(%d) > free_ent(%d)\n", sr.code, sr.free_ent)
+						fmt.Printf("!Err-> dcompress: insize(%d) posbits(%d)\n", sr.insize, sr.posbits-int(sr.n_bits))
+					}
+					sr.err = sr.ErrCorruptInput
+					return
+				}
+				sr.stackNdx--
+				sr.htab[sr.stackNdx] = byte(sr.finchar)
+				sr.code = sr.oldcode
+			}
+
+			// Generate output characters in reverse order
+			for sr.code >= 256 {
+				sr.stackNdx--
+				sr.htab[sr.stackNdx] = sr.htab[sr.code]
+				sr.code = code_int_type(sr.codetab[sr.code])
+			}
+
+			sr.finchar = int(byte(sr.htab[sr.code]))
+			sr.stackNdx--
+			sr.htab[sr.stackNdx] = byte(sr.finchar)
+
+			// Output the decoded string
+			i := (hSize*8 - 1) - sr.stackNdx
+			tmp := i + sr.outpos
+
+			if tmp >= oBufSize {
+				// Need to flush output buffer
+				for {
+					if i > (oBufSize - sr.outpos) {
+						i = oBufSize - sr.outpos
+					}
+					if i > 0 {
+						copy(sr.outbuf[sr.outpos:sr.outpos+i], sr.htab[sr.stackNdx:sr.stackNdx+i])
+						sr.outpos += i
+					}
+					if sr.outpos >= oBufSize {
+						// Flush to output
+						sr.flushOutput()
+					}
+					sr.stackNdx += i
+					i = (hSize*8 - 1) - sr.stackNdx
+					if i <= 0 {
+						break
+					}
+				}
+			} else {
+				copy(sr.outbuf[sr.outpos:sr.outpos+i], sr.htab[sr.stackNdx:sr.stackNdx+i])
+				sr.outpos += i
+			}
+
+			// Generate new entry in code table
+			code := sr.free_ent
+			if code < sr.maxmaxcode {
+				sr.codetab[code] = uint16(sr.oldcode)
+				sr.htab[code] = byte(sr.finchar)
+				sr.free_ent = code + 1
+			}
+			sr.oldcode = sr.incode
+		}
+
+		sr.bytes_in += sr.rsize
+
+		// Check if we're done reading
+		if sr.rsize <= 0 {
+			// Flush any remaining output
+			if sr.outpos > 0 {
+				sr.flushOutput()
+			}
+			sr.eof = true
+			return
+		}
+
+		// If we didn't process any codes and have no output, we might be stuck
+		if !processedAnyCode && len(sr.outputReady) == 0 {
+			break
+		}
+	}
+}
+
+// resetBuffer performs the resetbuf operation
+func (sr *StreamingReader) resetBuffer() {
+	o := sr.posbits >> 3
+	var e int
+	if o <= sr.insize {
+		e = sr.insize - o
+	} else {
+		e = 0
+	}
+
+	// Shift buffer contents
+	if e > 0 && o > 0 {
+		copy(sr.inbuf[0:e], sr.inbuf[o:o+e])
+	}
+	sr.insize = e
+	sr.posbits = 0
+}
+
+// flushOutput moves data from outbuf to outputReady
+func (sr *StreamingReader) flushOutput() {
+	if sr.outpos > 0 {
+		// Apply first character kludge if this is the first flush
+		if len(sr.outputReady) == 0 && sr.firstChar != 0 {
+			sr.outbuf[0] = sr.firstChar
+		}
+		sr.outputReady = append(sr.outputReady, sr.outbuf[0:sr.outpos]...)
+		sr.outpos = 0
+	}
+}
