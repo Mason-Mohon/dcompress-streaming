@@ -103,40 +103,7 @@ func dumpHTAB(s string) {
 //	Other than the kludge it's a very literal translation of compress42.c
 //
 // NewReader takes compressed data from input source r and returns a reader for the uncompressed version
-// For files >= 500MB compressed, uses streaming decompression to avoid loading entire file into memory
 func NewReader(r io.Reader) (io.Reader, error) {
-	// Try to determine compressed size
-	var compressedSize int64 = -1
-	if f, ok := r.(*os.File); ok {
-		if stat, err := f.Stat(); err == nil {
-			compressedSize = stat.Size()
-			if VerboseFlag {
-				fmt.Printf("dcompress: File size detected: %d bytes (%.2f MB)\n",
-					compressedSize, float64(compressedSize)/(1024*1024))
-			}
-		}
-	}
-
-	// Use streaming for large or unknown-size files
-	// NOTE: Streaming implementation is currently experimental and has bugs
-	// DISABLED FOR NOW - always use buffered mode
-	useStreaming := false // Set to true to enable streaming for large files
-	if useStreaming && compressedSize >= 500*1024*1024 {
-		if VerboseFlag {
-			fmt.Printf("dcompress: Using STREAMING mode for large file\n")
-		}
-		return newStreamingReader(r)
-	}
-
-	if VerboseFlag {
-		if compressedSize >= 0 {
-			fmt.Printf("dcompress: Using BUFFERED mode for file of size %.2f MB\n",
-				float64(compressedSize)/(1024*1024))
-		} else {
-			fmt.Printf("dcompress: Using BUFFERED mode (size unknown)\n")
-		}
-	}
-
 	// NOTE BENE: sections that start with if DEBUG or if BUG will be removed by the compiler
 	// since they compile to if false.  Leaving them in for now won't hurt anything.  Once code is
 	// tested fully they can be stripped.
@@ -180,8 +147,8 @@ func NewReader(r io.Reader) (io.Reader, error) {
 		fmt.Printf("entered decompress()\n")
 	}
 
-	g_inbuf = make([]byte, iBufSize+64)
-	g_outbuf = make([]byte, oBufSize+2048)
+	g_inbuf = make([]byte, iBufSize+64, iBufSize+64)
+	g_outbuf = make([]byte, oBufSize+2048, oBufSize+2048)
 	outBuf = make([]byte, 0, 10000)
 	if BUG == 1 {
 		fmt.Printf("Sizeof(htab)= %d\n", len(g_htab)*1)
