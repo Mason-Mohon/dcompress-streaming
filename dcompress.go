@@ -114,7 +114,9 @@ func NewReader(r io.Reader) (io.Reader, error) {
 	}
 
 	// Use streaming for large or unknown-size files
-	if compressedSize < 0 || compressedSize >= 500*1024*1024 {
+	// NOTE: Streaming implementation is currently experimental
+	// For production use, only enable for very large files or disable entirely
+	if compressedSize >= 500*1024*1024 {
 		return newStreamingReader(r)
 	}
 
@@ -780,16 +782,13 @@ func (sr *StreamingReader) Read(p []byte) (n int, err error) {
 
 // decompressChunk processes the next chunk of compressed data
 func (sr *StreamingReader) decompressChunk() {
-	// Handle resetbuf at the start if flagged
-	if sr.needsResetbuf {
-		sr.resetBuffer()
-		sr.needsResetbuf = false
-	}
-
 	// Main decompression loop - process until we have output or hit EOF
 	for len(sr.outputReady) == 0 && !sr.eof && sr.err == nil {
-		// Reset buffer logic
-		sr.resetBuffer()
+		// Handle resetbuf at the start if flagged
+		if sr.needsResetbuf {
+			sr.resetBuffer()
+			sr.needsResetbuf = false
+		}
 
 		// Read more input if needed
 		if sr.insize < (len(sr.inbuf) - iBufSize) {
